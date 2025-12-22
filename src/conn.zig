@@ -118,16 +118,16 @@ pub const Conn = struct {
     }
 
     // Returns an object with alternative implementation of
-    // exec, row, rows, and prepare, where params ? can
-    // be used with slices or arrays.
-    //
-    // Note: Only ? and ?NNN are supported.
+    // exec, row, rows, and prepare, where the syntax is extended
+    // to allow binding with slices and array with ?? and ??NNN.
     //
     // For example, the following:
+    //
     //    const ids: []const i64 = &.{ 1, 2, 3 };
-    //    try conn.variadic().exec("select 1 from table where id in (?)", .{ids});
+    //    try conn.variadic().exec("select 1 from table where id in (??)", .{ids});
     //
     // ...is equivalent to:
+    //
     //    try conn.variadic().exec("select 1 from table where id in (?, ?, ?)", .{1,2,3});
     pub fn variadic(self: Conn) VariadicBinder {
         return .{ .conn = &self };
@@ -608,10 +608,16 @@ const VariadicBinder = struct {
             // So to simplify the splatting, all ?NNN are replaced with ?,
             // at the expense of explictly binding all the parameters.
 
-            try buf.writer.writeAll(sql[str_index..entry.str_index]);
+            const end = (if (entry.splat) entry.str_index - 1 else entry.str_index);
+
+            try buf.writer.writeAll(sql[str_index..end]);
             try buf.writer.writeByte('?');
 
-            if (comptime isIterable(@TypeOf(value))) {
+            if (comptime entry.splat) {
+                if (!comptime isIterable(@TypeOf(value))) {
+                    @compileError("?? can only be used for arrays or slices");
+                }
+
                 const count = value.len - 1;
                 const limit = 64;
                 switch (count) {
@@ -632,13 +638,14 @@ const VariadicBinder = struct {
         }
 
         try buf.writer.writeAll(sql[str_index..]);
+
         const stmt = try self.conn.prepare(buf.written());
 
         var param_index: usize = 0;
         inline for (indices) |entry| {
             const value = values[entry.arg_index];
 
-            if (comptime isIterable(@TypeOf(value))) {
+            if (comptime entry.splat) {
                 for (value) |item| {
                     try stmt.bindValue(item, param_index);
                     param_index += 1;
@@ -660,16 +667,20 @@ const VariadicBinder = struct {
         // otherwise the value is based on highest arg_index seen so far
         arg_index: usize = 0,
 
-        // how many digits after ? (e.g. ?NNNNN would be 5)
+        // how long this substring is, from ? to the last digit if any
         num_digits: usize = 0,
+
+        // true if ?? is used which indicates
+        // whether an array or slice is expected
+        splat: bool = false,
     };
 
     fn getParamIndices(comptime str: []const u8) [CountParams(str)]IndexEntry {
         comptime {
-            var indices: [CountParams(str)]IndexEntry = @splat(.{});
-            if (indices.len == 0) return indices;
+            var result: [CountParams(str)]IndexEntry = @splat(.{});
+            if (result.len == 0) return result;
 
-            var index: usize = 0;
+            var res_index: usize = 0;
             var arg_index: usize = 0;
             var str_index: usize = 0;
 
@@ -677,7 +688,13 @@ const VariadicBinder = struct {
                 str_index = std.mem.indexOfScalarPos(u8, str, str_index, '?') orelse break;
 
                 defer {
-                    index += 1;
+                    res_index += 1;
+                    str_index += 1;
+                }
+
+                var splat = false;
+                if (str_index + 1 < str.len and str[str_index + 1] == '?') {
+                    splat = true;
                     str_index += 1;
                 }
 
@@ -695,33 +712,49 @@ const VariadicBinder = struct {
                     var parsed = (std.fmt.parseInt(u8, digits, 10) catch unreachable);
                     parsed -= 1; // deduct since ?NNN is starts at 1
 
-                    indices[index] = .{
+                    result[res_index] = .{
                         .str_index = str_index,
                         .arg_index = parsed,
                         .num_digits = digits.len,
+                        .splat = splat,
                     };
-
-                    if (parsed >= index)
-                        arg_index = parsed + 1
-                    else
-                        arg_index += 1;
+                    if (parsed >= res_index)
+                        arg_index = parsed + 1;
                 } else {
-                    indices[index] = .{
+                    result[res_index] = .{
                         .str_index = str_index,
                         .arg_index = arg_index,
+                        .splat = splat,
                         .num_digits = 0,
                     };
                     arg_index += 1;
                 }
             }
 
-            return indices;
+            return result;
         }
     }
 
-    // Returns the total number of ? in the string
+    // Returns the total number of ? or ?? in the string
     fn CountParams(comptime str: []const u8) usize {
-        return comptime std.mem.count(u8, str, "?");
+        comptime {
+            var i: usize = 0;
+            var count: usize = 0;
+            while (i < str.len) {
+                i = std.mem.indexOfScalarPos(u8, str, i, '?') orelse {
+                    break;
+                };
+
+                i += 1;
+                count += 1;
+
+                // count ?? as one
+                if (i < str.len and str[i] == '?') {
+                    i += 1;
+                }
+            }
+            return count;
+        }
     }
 
     // Returns true if value is a slice, array or anything that
@@ -969,10 +1002,11 @@ test "bind variadic" {
     const stmt = try conn.variadic().prepareAndBind(allocator,
         \\
         \\ select * from test
-        \\ where id in (?)
-        \\    or id = ?2
-        \\    or id in (?1)
-    , .{ ids, 456 });
+        \\ where id in (??1)
+        \\    or id = ?
+        \\    or id in (??1)
+        \\    or ctext = ?3
+    , .{ ids, 456, "foo" });
     defer stmt.deinit();
 
     const expanded = try stmt.expandedSql(allocator);
@@ -984,6 +1018,7 @@ test "bind variadic" {
         \\ where id in (1, 2, 3)
         \\    or id = 456
         \\    or id in (1, 2, 3)
+        \\    or ctext = 'foo'
     , expanded);
 }
 
